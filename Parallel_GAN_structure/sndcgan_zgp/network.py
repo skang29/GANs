@@ -85,10 +85,10 @@ class Network(object):
         self.dLoss[fake] = loss_iterator(self.D[fake][logits], tf.zeros_like)
 
         # Gradient Penalty on real distribution
-        self.gp_loss = gradient_penalty(self.x, self.D[real][logits], self.tower_config)
+        # self.gp_loss = gradient_penalty(self.x, self.D[real][logits], self.tower_config)
 
         self.dPureLoss = self.dLoss[real] + self.dLoss[fake]
-        self.d_loss = self.dPureLoss + self.gp_loss
+        self.d_loss = self.dPureLoss #+ self.gp_loss
 
 
         # Generator loss
@@ -109,4 +109,5 @@ class Network(object):
                          gf_dim=self.gf_dim,
                          name="generator",
                          reuse=self.reuse,
-                         tower_config=self.tower_config)
+                         tower_config=self.tower_config,
+                         is_training=self.is_training)

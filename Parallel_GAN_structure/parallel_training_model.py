@@ -2,13 +2,15 @@ import os
 import time
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib.nccl.python.ops import nccl_ops
+nccl_ops._maybe_load_nccl_ops_so()
 
 from base_model import BaseModel
 
 from sndcgan_zgp import Network
 from sndcgan_zgp.utils import *
 from sndcgan_zgp.ops import nccl_all_mean, network_mean, nccl_all_sum
-from sndcgan_zgp.ops import TowerConfig, device_sync_op, optimizer_op
+from sndcgan_zgp.ops import TowerConfig, device_sync_op, optimizer_op, device_sync_op_test
 
 from data_loader import parallel_image_filename_loader
 
@@ -79,7 +81,7 @@ class TrainingModel(BaseModel):
 
             image_resized = image_resized / 127.5 - 1
 
-            return image_resized, number
+            return image_resized
 
         def _parse_function_test(fname, z):
             image_string = tf.read_file(fname)
@@ -126,9 +128,6 @@ class TrainingModel(BaseModel):
             )
             self.iterator[device] = dataset.make_initializable_iterator()
 
-            x, self.num = self.iterator[device].get_next()
-            self.z = z = tf.random_normal(shape=[batch_size, z_dim], dtype=tf.float32, name="z")
-
             # For test
             if tower_config.is_main:
                 self.sample_z = tf.constant(np.random.normal(0.0, 1.0,
@@ -147,16 +146,23 @@ class TrainingModel(BaseModel):
 
                 self.iterator['test'] = test_dataset.make_initializable_iterator()
 
+                # Only for test
                 sample_x, sample_z = self.iterator['test'].get_next()
+
+
         print("Done !")
 
         # Building network
         print("Build Network ...")
         network_list = list()
-        dummy_test_network_list = list()
         for idx, (device, tower_config) in enumerate(zip(self.device_list, tower_config_list)):
+            print("\tCreating gpu tower @ {:d} on device {:s}".format(idx, device))
+
+            # Fetch dataflow
+            x = self.iterator[device].get_next()
+
             with tf.device(device), tf.variable_scope(tower_prefix.format(idx)):
-                print("\tCreating gpu tower @ {:d} on device {:s}".format(idx, device))
+                z = tf.random_normal(shape=[batch_size, z_dim], dtype=tf.float32, name="z")
 
                 # Establish network
                 network = Network(name="Network",
@@ -170,45 +176,44 @@ class TrainingModel(BaseModel):
                 network.build_network(x=x, z=z)
                 network_list.append(network)
 
-                # Establish dummy test network
-                dummy = Network(name="Network",
-                                batch_size=1,
-                                size=size,
-                                gf_dim=gf_dim,
-                                df_dim=df_dim,
-                                reuse=True,
-                                is_training=False,
-                                tower_config=tower_config)
-
-                dummy.build_network(z=sample_z, x=sample_x)
-                dummy_test_network_list.append(dummy)
-
                 # Establish test network
                 if tower_config.is_main:
                     print("\t +- Test network @  tower {:d} on device {:s}".format(idx, device))
+
+                    dummy = Network(name="Network",
+                                    batch_size=1,
+                                    size=size,
+                                    gf_dim=gf_dim,
+                                    df_dim=df_dim,
+                                    reuse=True,
+                                    is_training=False,
+                                    tower_config=tower_config)
+                    dummy.build_network(z=sample_z, x=sample_x)
 
                     self.test_network = dummy
                     self.sampler = self.test_network.y
                     self.input_checker = self.test_network.x
 
-        self.test_enforcer = nccl_all_sum(dummy_test_network_list, lambda x: x.y)
-
+        # Using NCCL library. Need to run all variables in list.
+        # Otherwise, it will hang.
         g_loss_list = nccl_all_mean(network_list, lambda x: x.g_loss)
         d_loss_list = nccl_all_mean(network_list, lambda x: x.d_loss)
 
-        self.g_loss = network_mean(network_list, lambda x: x.g_loss)
-        self.d_loss = network_mean(network_list, lambda x: x.d_loss)
-        self.gp_loss = network_mean(network_list, lambda x: x.gp_loss)
+        self.g_loss_raw = [x.g_loss for x in network_list]
+        self.d_loss_raw = [x.d_loss for x in network_list]
 
+        self.g_loss = network_mean(network_list, lambda x:x.g_loss)
+        self.d_loss = network_mean(network_list, lambda x:x.d_loss)
         print(">> Done.")
 
         # Compute gradients
         print("Compute gradients ... ", end=' ', flush=True)
-        self.g_optimize_op = optimizer_op(g_loss_list, network_list, self.gOptim, var_name="type__generator")
         self.d_optimize_op = optimizer_op(d_loss_list, network_list, self.dOptim, var_name="type__discriminator")
+        self.g_optimize_op = optimizer_op(g_loss_list, network_list, self.gOptim, var_name="type__generator")
         print("Done !")
 
         self.sync_op = device_sync_op(tower_prefix, main_idx)
+        self.sync_op_indiv = device_sync_op_test(tower_prefix, main_idx)
         self.network_list = network_list
 
         # Saver to save only main tower.
@@ -242,7 +247,7 @@ class TrainingModel(BaseModel):
 
         # Check test input
         print("Checking input pipeline ... ", end=' ', flush=True)
-        y_sample, x_sample, _ = self.sample_runner([self.test_network.y, self.test_network.x, self.test_enforcer])
+        y_sample, x_sample = self.sample_runner([self.test_network.y, self.test_network.x])
         save_images(y_sample,
                     image_manifold_size(len(y_sample)),
                     os.path.join(self.get_result_dir(), "9_naive_gen_image.jpg"))
@@ -264,24 +269,25 @@ class TrainingModel(BaseModel):
         effective_num_batch = (self.num_batch // len(self.device_list))
         print("CKPT directory: {}".format(self.get_checkpoint_dir()))
         print("Effective batch size: {}".format(self.config.batch_size * len(self.device_list)))
+
         while counter // effective_num_batch < config.epoch:
             epoch = counter // effective_num_batch
             idx = counter % effective_num_batch
             counter += 1
 
             # Syncing
-            if np.mod(counter, 10000) == 0:
+            if np.mod(counter, 5000) == 0:
                 if not self.num_device == 1:
                     self.sess.run(self.sync_op)
                     print("Sync towers on step {}.".format(counter))
 
+            # Update D network
             for i_discriminator in range(config.discriminator_iteration):
-                # Update D network
-                _, num_d = self.sess.run([self.d_optimize_op, self.num])
+                self.sess.run(self.d_optimize_op)
 
-            # Update G network
+            # # Update G network
             for i_generator in range(config.generator_iteration):
-                _, num_g = self.sess.run([self.g_optimize_op, self.num])
+                self.sess.run(self.g_optimize_op)
 
             if np.mod(counter, config.print_interval) == 1:
                 elapsed_time = int(time.time() - start_time)
@@ -289,38 +295,49 @@ class TrainingModel(BaseModel):
                 e_min = (elapsed_time // 60) % 60
                 e_hr = elapsed_time // 3600
 
-                dLoss, gLoss, gpLoss = self.sess.run([self.d_loss, self.g_loss, self.gp_loss])
+                dLoss, gLoss = self.sess.run([self.d_loss, self.g_loss])
                 print("Epoch: [{epoch:2d}/{config_epoch:2d}] ".format(epoch=epoch, config_epoch=config.epoch) + \
                       "[{idx:4d}/{batch_idxs:2d}] ".format(idx=idx, batch_idxs=effective_num_batch) + \
                       "time: {e_hr:02d}:{e_min:02d}:{e_sec:02d} ".format(e_hr=e_hr, e_min=e_min, e_sec=e_sec) + \
                       "d_loss: {dLoss:.4f} ".format(dLoss=dLoss) + \
-                      "penalty: {gp:.4f} ".format(gp=gpLoss) + \
+                      # "penalty: {gp:.4f} ".format(gp=gpLoss) + \
                       "g_loss: {gLoss:.4f} ".format(gLoss=gLoss)
                       )
 
             if np.mod(counter, config.sample_interval) == 0:
-                y_sample, _ = self.sample_runner([self.test_network.y, self.test_enforcer])
+                y_sample = self.sample_runner([self.test_network.y])
+                y_sample = y_sample[0]
                 save_images(y_sample,
                             image_manifold_size(len(y_sample)),
                             os.path.join(self.get_result_dir(),
                                          "Result",
                                          '{epoch:05d}_{idx:04d}.jpg'.format(epoch=epoch, idx=idx)))
 
-                step_time = int((time.time() - epoch_time) / config.sample_interval * effective_num_batch) # time / epoch
+                step_time = (time.time() - epoch_time) / config.sample_interval
+                time_per_10k_step = int(step_time * 10000)
+                time_per_epoch = int(step_time * effective_num_batch)  # time / epoch
                 epoch_time = time.time()
 
-                s_sec = step_time % 60
-                s_min = (step_time // 60) % 60
-                s_hr = step_time // 3600
+                s_sec = time_per_epoch % 60
+                s_min = (time_per_epoch // 60) % 60
+                s_hr = time_per_epoch // 3600
 
-                epoch_speed = 1 / step_time * 3600
+                k_sec = time_per_10k_step % 60
+                k_min = (time_per_10k_step // 60) % 60
+                k_hr = time_per_10k_step // 3600
+
+                epoch_speed = 1 / time_per_epoch * 3600
                 print("[Sample] " + \
                       "Time per epoch: {e_hr:02d}:{e_min:02d}:{e_sec:02d}\t".
                       format(e_hr=s_hr, e_min=s_min, e_sec=s_sec) + \
-                      "Epoch speed: {:.3f} eph".format(epoch_speed))
+                      "Epoch speed: {:.3f} eph\t".format(epoch_speed) + \
+                      "Steps: {:d}\t".format(counter) + \
+                      "Time per 10K steps: {e_hr:02d}:{e_min:02d}:{e_sec:02d}\t".
+                      format(e_hr=k_hr, e_min=k_min, e_sec=k_sec)
+                      )
 
-            if idx == effective_num_batch // 2:
-                self.saver.save(self.sess, os.path.join(self.get_checkpoint_dir(), "Ckpt"), global_step=epoch * 10)
+            # if idx == effective_num_batch // 2:
+            #     self.saver.save(self.sess, os.path.join(self.get_checkpoint_dir(), "Ckpt"), global_step=epoch * 10)
             if idx == effective_num_batch - 1:
                 self.saver.save(self.sess, os.path.join(self.get_checkpoint_dir(), "Ckpt"), global_step=epoch * 10 + 5)
 

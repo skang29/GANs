@@ -76,12 +76,14 @@ def all_reduce_grads(all_grads, average=True):
 
 
 def optimizer_op(losses, network_list, optimizer_lambda_function, var_name=None):
-    optimizer = optimizer_lambda_function()
     tower_grads = list()
+    optimizer_list = list()
 
     var_name_str = "" if var_name is None else "_{}".format(var_name)
 
     for idx, (network, loss) in enumerate(zip(network_list, losses)):
+        optimizer_ = optimizer_lambda_function()
+        optimizer_list.append(optimizer_)
         with tf.device(network.tower_config.device_name), tf.variable_scope(network.tower_config.name):
             tvars = [var for var in tf.trainable_variables() if network.tower_config.name in var.name]
 
@@ -91,25 +93,104 @@ def optimizer_op(losses, network_list, optimizer_lambda_function, var_name=None)
                 op_vars = [var for var in tvars if var_name in var.name]
 
             tower_grads.append(
-                [grad for grad in optimizer.compute_gradients(loss, var_list=op_vars) if grad[0] is not None])
+                # [grad for grad in optimizer_.compute_gradients(loss, var_list=op_vars) if grad[0] is not None])
+                [grad for grad in optimizer_.compute_gradients(loss, var_list=op_vars) if grad[0] is not None])
 
     grads = all_reduce_grads(tower_grads)
 
     train_ops = []
-    for idx, (grad_and_vars, network) in enumerate(zip(grads, network_list)):
+    for idx, (grad_and_vars, network, optimizer) in enumerate(zip(grads, network_list, optimizer_list)):
         with tf.name_scope("apply_gradients"), tf.device(network.tower_config.device_name):
             update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope=network.tower_config.name)
             with tf.control_dependencies(update_ops):
                 train_ops.append(optimizer.apply_gradients(grad_and_vars,
                                                            name='apply_grad{}_{}'.format(var_name_str,
-                                                                                         network.tower_config.name)))
+                                                                                         network.tower_config.idx)))
 
     optimize_op = tf.group(*train_ops, name="train_op{}".format(var_name_str))
 
     return optimize_op
 
 
+def optimizer_op__(loss, network_list, optimizer_lambda_function, var_name=None):
+    tower_grads = list()
+    optimizer_list = list()
+
+    var_name_str = "" if var_name is None else "_{}".format(var_name)
+
+    for idx, network in enumerate(network_list):
+        optimizer_ = optimizer_lambda_function()
+        optimizer_list.append(optimizer_)
+        with tf.device(network.tower_config.device_name), tf.variable_scope(network.tower_config.name):
+            tvars = [var for var in tf.trainable_variables() if network.tower_config.name in var.name]
+
+            if var_name is None:
+                op_vars = tvars
+            else:
+                op_vars = [var for var in tvars if var_name in var.name]
+
+            tower_grads.append(
+                # [grad for grad in optimizer_.compute_gradients(loss, var_list=op_vars) if grad[0] is not None])
+                [grad for grad in optimizer_.compute_gradients(loss, var_list=op_vars) if grad[0] is not None])
+
+    grads = all_reduce_grads(tower_grads)
+
+    import pprint
+    pprint.pprint(grads)
+
+    grad_list = list()
+
+    for grad in grads:
+        for g in grad:
+            grad_list.append(g[0])
+
+    train_ops = []
+    for idx, (grad_and_vars, network, optimizer) in enumerate(zip(grads, network_list, optimizer_list)):
+        with tf.name_scope("apply_gradients"), tf.device(network.tower_config.device_name):
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope=network.tower_config.name)
+            with tf.control_dependencies(update_ops):
+                train_ops.append(optimizer.apply_gradients(grad_and_vars,
+                                                           name='apply_grad{}_{}'.format(var_name_str,
+                                                                                         network.tower_config.idx)))
+
+    optimize_op = tf.group(*train_ops, name="train_op{}".format(var_name_str))
+
+    return optimize_op, grad_list
+
+
 def device_sync_op(prefix, main_idx):
+    import re
+    all_vars = tf.global_variables() + tf.local_variables()
+    var_by_name = dict([(v.name, v) for v in all_vars])
+
+    post_init_ops = []
+    match_re = r"{}\d+".format(prefix.format(""))
+    regex = re.compile(match_re)
+    main_tower_name = prefix.format(main_idx)
+    for v in all_vars:
+        tower_name = regex.search(v.name)
+        if tower_name is None:
+            continue
+
+        if main_tower_name == tower_name:
+            # no need to copy to main tower
+            continue
+
+        tower_name = tower_name.group()
+
+        copy_from = var_by_name.get(v.name.replace(tower_name, main_tower_name))
+        if v.name == copy_from:
+            continue
+
+        if copy_from is not None:
+            post_init_ops.append(v.assign(copy_from.read_value()))
+        else:
+            UserWarning("Cannot find {} in the graph!".format(v.name.replace(tower_name, main_tower_name)))
+
+    return tf.group(*post_init_ops, name="sync_variables_from_main_tower")
+
+
+def device_sync_op_test(prefix, main_idx):
     import re
     all_vars = tf.global_variables() + tf.local_variables()
     var_by_name = dict([(v.name, v) for v in all_vars])
@@ -129,12 +210,15 @@ def device_sync_op(prefix, main_idx):
         tower_name = tower_name.group()
 
         copy_from = var_by_name.get(v.name.replace(tower_name, main_tower_name))
+        if tower_name == main_tower_name:
+            continue
+
         if copy_from is not None:
-            post_init_ops.append(v.assign(copy_from.read_value()))
+            post_init_ops.append(dict(ops=v.assign(copy_from.read_value()), name=v.name))
         else:
             UserWarning("Cannot find {} in the graph!".format(v.name.replace(tower_name, main_tower_name)))
 
-    return tf.group(*post_init_ops, name="sync_variables_from_main_tower")
+    return post_init_ops
 
 
 class TowerConfig(object):

@@ -1,5 +1,6 @@
 import os
 os.environ["nccl_multigpu_env"] = 'true'
+# os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 import numpy as np
 import tensorflow as tf
@@ -14,8 +15,8 @@ flags.DEFINE_integer("gf_dim", 64, "Latent space dimensions [100]")
 flags.DEFINE_integer("df_dim", 64, "Latent space dimensions [100]")
 
 # Model options
-flags.DEFINE_string("model_name", "SNDCGAN_Type2_ZGP_PM", "Epoch to train [25]")
-flags.DEFINE_integer("epoch", 50, "Epoch to train [25]")
+flags.DEFINE_string("model_name", "SNDCGAN_TypeB", "Epoch to train [25]")
+flags.DEFINE_integer("epoch", 400, "Epoch to train [25]")
 flags.DEFINE_integer("batch_size", 64, "The size of batch images per one GPU. [64]")
 flags.DEFINE_integer("sample_num", 64, "The size of sample images [64]")
 flags.DEFINE_string("dataset", "LSUN_CHURCH_CENTER_SQUARE_256/images", "The name of dataset [celebA, mnist, lsun]")
@@ -32,16 +33,18 @@ flags.DEFINE_boolean("train", True, "True for training, False for testing [False
 flags.DEFINE_string("checkpoint_dir", None, "Restoring checkpoint dir. [None : No restoring]")
 flags.DEFINE_list("restore_list", ["type__"], "Restoring variable list. [None : No restoring]")
 
-flags.DEFINE_integer("sample_interval", 50, "Sample image interval. [50]")
+flags.DEFINE_integer("sample_interval", 400, "Sample image interval. [50]")
 flags.DEFINE_integer("print_interval", 25, "Status print interval. [50]")
 flags.DEFINE_integer("ckpt_interval", 100, "Ckpt save interval. [50]")
 
 # System options
-flags.DEFINE_list("device_list", ['/gpu:0', '/gpu:1'], "GPU to utilize.")
+gpu_list = [str(x) for x in [0, 1, 2, 3, 4, 5, 6, 7]]
+print("Visible devices: ", ", ".join(gpu_list))
+flags.DEFINE_list("device_list", ['/gpu:{}'.format(x) for x in range(len(gpu_list))], "GPU to utilize.")
 
 flags.DEFINE_string("base_dir", "./Container", "Root directory of ckpt, results, logs [container]")
 flags.DEFINE_float("memory_limit", None, "Per GPU memory fraction. [None: No limit]")
-flags.DEFINE_string("visible_devices", None, "Visible GPU selection for the training. [None: Use all]")
+flags.DEFINE_string("visible_devices", ", ".join(gpu_list), "Visible GPU selection for the training. [None: Use all]")
 
 FLAGS = flags.FLAGS
 

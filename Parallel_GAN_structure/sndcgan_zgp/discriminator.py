@@ -45,7 +45,6 @@ def discriminator(image_, batch_size, df_dim, tower_config=None, name="discrimin
 def init_stage(image_, batch_size, conv_dims, name="init_stage", sn=False, tower_config=None):
     with tf.variable_scope(name):
         nets = image_
-        # nets = conv2d(image_, conv_dims, kernel=(3, 3), strides=(1, 1), sn=sn)
         nets = residual_block(nets, conv_dims, normalization=False, sn=sn, tower_config=tower_config)
         nets = tf.nn.avg_pool(nets, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="VALID")
 

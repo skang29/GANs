@@ -51,7 +51,7 @@ if NCCL_FLAG == 'true':
         return w_norm
 
 
-    def __group_norm(xxx, G=32, eps=1e-5, name='group_norm', tower_config=None):
+    def just_for_reference(xxx, G=32, eps=1e-5, name='group_norm', tower_config=None):
         x = xxx
         with tf.variable_scope(name):
             N, H, W, C = x.get_shape().as_list()
@@ -96,44 +96,10 @@ if NCCL_FLAG == 'true':
         return xxx
 
 
-    def group_norm(x, G=32, eps=1e-5, name='group_norm', tower_config=None):
+    def group_norm(x, G=32, name='group_norm', tower_config=None):
+        """Doesn't need cross-batch computation."""
         with tf.variable_scope(name):
-            N, H, W, C = x.get_shape().as_list()
-            G = min(G, C)
-
-            x = tf.reshape(x, [N, H, W, G, C // G])
-
-            # Go! NCCL!
-            with tf.variable_scope("mean"):
-                shared_name = tf.get_variable_scope().name. \
-                    replace(tower_config.name, tower_config.prefix.format("NCCL"))
-                device_mean = tf.reduce_mean(x, axis=[1, 2, 4], keepdims=True)
-                mean = gen_nccl_ops.nccl_all_reduce(
-                    input=device_mean,
-                    reduction="sum",
-                    num_devices=tower_config.num_devices,
-                    shared_name=shared_name
-                ) / (1.0 * tower_config.num_devices)
-
-            with tf.variable_scope("var"):
-                shared_name = tf.get_variable_scope().name. \
-                    replace(tower_config.name, tower_config.prefix.format("NCCL"))
-                device_var = tf.reduce_mean(tf.square(x - mean), axis=[1, 2, 4], keepdims=True)
-                var = gen_nccl_ops.nccl_all_reduce(
-                    input=device_var,
-                    reduction="sum",
-                    num_devices=tower_config.num_devices,
-                    shared_name=shared_name
-                ) / (1.0 * tower_config.num_devices)
-
-            x = (x - mean) / tf.sqrt(var + eps)
-
-            gamma = tf.get_variable('gamma', [1, 1, 1, C], initializer=tf.constant_initializer(1.0))
-            beta = tf.get_variable('beta', [1, 1, 1, C], initializer=tf.constant_initializer(0.0))
-
-            x = tf.reshape(x, [N, H, W, C]) * gamma + beta
-
-        return x
+            return tf.contrib.layers.group_norm(x)
 
 
     def layer_norm(x, name="layer_norm", tower_config=None):
@@ -183,19 +149,7 @@ else:
 
     def group_norm(x, G=32, eps=1e-5, name='group_norm'):
         with tf.variable_scope(name):
-            N, H, W, C = x.get_shape().as_list()
-            G = min(G, C)
-
-            x = tf.reshape(x, [N, H, W, G, C // G])
-            mean, var = tf.nn.moments(x, [1, 2, 4], keep_dims=True)
-            x = (x - mean) / tf.sqrt(var + eps)
-
-            gamma = tf.get_variable('gamma', [1, 1, 1, C], initializer=tf.constant_initializer(1.0))
-            beta = tf.get_variable('beta', [1, 1, 1, C], initializer=tf.constant_initializer(0.0))
-
-            x = tf.reshape(x, [N, H, W, C]) * gamma + beta
-
-        return x
+            return tf.contrib.layers.group_norm(x)
 
 
     def layer_norm(x, name="layer_norm"):
