@@ -10,6 +10,7 @@ __version__ = "1.0.0"
 import os
 import tensorflow as tf
 from tensorflow.contrib.nccl.ops import gen_nccl_ops
+from ..nccl_utils import nccl_device_mean
 NCCL_FLAG = os.environ.get('nccl_multigpu_env')
 
 
@@ -26,15 +27,7 @@ if NCCL_FLAG == 'true':
             gradient = tf.gradients(tf.reduce_sum(logits), [data])[0]
             slope_square = tf.reduce_mean(tf.reduce_sum(tf.square(gradient), reduction_indices=[1, 2, 3]))
 
-            shared_name = slope_square.name. \
-                replace(tower_config.name, tower_config.prefix.format(nccl_name))
-
-            penalty = gen_nccl_ops.nccl_all_reduce(
-                input=slope_square,
-                reduction="sum",
-                num_devices=tower_config.num_devices,
-                shared_name=shared_name
-            ) / (1.0 * tower_config.num_devices * coefficient)
+            penalty = nccl_device_mean(slope_square, tower_config) * coefficient
 
             return penalty
 

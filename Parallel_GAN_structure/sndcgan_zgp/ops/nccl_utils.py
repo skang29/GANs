@@ -9,6 +9,7 @@ __version__ = "1.0.0"
 
 import os
 import tensorflow as tf
+from tensorflow.contrib.nccl.ops import gen_nccl_ops
 NCCL_FLAG = os.environ.get('nccl_multigpu_env')
 
 
@@ -29,6 +30,25 @@ def nccl_all_mean(network_list, lambda_function):
             data_list.append(element / (1.0 * len(network_list)))
 
     return data_list
+
+
+def nccl_device_sum(input_, tower_config):
+    nccl_name = "NCCL" if not tower_config.is_test else "NCCL_TEST"
+
+    shared_name = input_.name.replace(tower_config.name, tower_config.prefix.format(nccl_name))
+
+    output_ = gen_nccl_ops.nccl_all_reduce(
+        input=input_,
+        reduction="sum",
+        num_devices=tower_config.num_devices,
+        shared_name=shared_name
+    )
+
+    return output_
+
+
+def nccl_device_mean(input_, tower_config):
+    return nccl_device_sum(input_, tower_config) / (1.0 * tower_config.num_devices)
 
 
 def all_reduce_grads(all_grads, average=True):
