@@ -8,7 +8,7 @@ def image_filename_loader(data_dir,
                           sample_num,
                           batch_size,
                           repeat=1,
-                          remainder_handling_policy="drop",
+                          remainder_handling_policy="random_fill",
                           preload_filename="data_list.txt",
                           image_type='jpg'):
     """

@@ -1,16 +1,14 @@
 from tensorflow.contrib.nccl.python.ops import nccl_ops
+from .customs import *
+from .nccl_utils import *
+from .layers import *
+from .core import *
+from .blocks import *
+from .normalizations import *
+
+
 # Force including NCCL Ops
 nccl_ops._maybe_load_nccl_ops_so()
-
-from .activations import *
-from .blocks import *
-from .convolutions import *
-from .linears import *
-from .losses import *
-from .normalizations import *
-from .tfthings import *
-
-from .customs import *
 
 
 VERSION_INFO = \
@@ -20,6 +18,7 @@ VERSION_INFO = \
 | Change log
 |   * Version established.
 |   * Parallel mode added.
-| Modified date: 2018.10.30.
+|   * New ops structure established.
+| Modified date: 2018.11.21.
 ----------------------------"""
 print(VERSION_INFO)

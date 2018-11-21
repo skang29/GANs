@@ -23,53 +23,6 @@ VERSION_INFO = \
 print(VERSION_INFO)
 
 
-# From tensorpack
-@contextmanager
-def custom_getter_scope(custom_getter):
-    """
-    Args:
-        custom_getter: the same as in :func:`tf.get_variable`
-
-    Returns:
-        The current variable scope with a custom_getter.
-    """
-    scope = tf.get_variable_scope()
-    with tf.variable_scope(
-            scope, custom_getter=custom_getter,
-            auxiliary_name_scope=False):
-        yield
-
-
-def _replace_global_by_local(kwargs):
-    if 'collections' in kwargs:
-        collections = kwargs['collections']
-    if not collections:
-        collections = set([tf.GraphKeys.GLOBAL_VARIABLES])
-    else:
-        collections = set(collections.copy())
-    collections.remove(tf.GraphKeys.GLOBAL_VARIABLES)
-    collections.add(tf.GraphKeys.LOCAL_VARIABLES)
-    kwargs['collections'] = list(collections)
-
-
-@contextmanager
-def override_to_local_variable(enable=True):
-    """
-    Returns:
-        a context where all variables will be created as local.
-    """
-    if enable:
-
-        def custom_getter(getter, name, *args, **kwargs):
-            _replace_global_by_local(kwargs)
-            return getter(name, *args, **kwargs)
-
-        with custom_getter_scope(custom_getter):
-            yield
-    else:
-        yield
-
-
 def get_stddev(x, k_h, k_w):
     return 1 / math.sqrt(k_w * k_h * x.get_shape()[-1])
 

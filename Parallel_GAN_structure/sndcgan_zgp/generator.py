@@ -5,6 +5,10 @@ from .ops import *
 from .utils import print_info
 
 
+def normalization_function(nets, name="norm", tower_config=None):
+    return batch_norm(nets, name=name, tower_config=tower_config)
+
+
 def decoder(z_, batch_size, size, gf_dim, name="decoder", sn=False, reuse=False, debug=False, tower_config=None, is_training=False):
     with tf.variable_scope("type__generator"):
         with tf.variable_scope(name, reuse=reuse):
@@ -53,7 +57,7 @@ def repeat_stage(nets, batch_size, conv_dims, name="repeat_stage", sn=False, tow
 def final_stage(nets, batch_size, conv_dims, name="final_stage", sn=False, tower_config=None, is_training=False):
     with tf.variable_scope(name):
         nets = up_block(nets, batch_size, conv_dims, sn=sn, tower_config=tower_config)
-        nets = group_norm(nets)
+        nets = batch_norm(nets, tower_config=tower_config)
         nets = relu(nets, tower_config=tower_config)
         nets = conv2d(nets, 3, kernel=(3, 3), strides=(1, 1), sn=sn, tower_config=tower_config)
 
@@ -63,7 +67,7 @@ def final_stage(nets, batch_size, conv_dims, name="final_stage", sn=False, tower
 def up_block(x, batch_size, conv_dims, name="upblock", sn=False, tower_config=None, is_training=False):
     with tf.variable_scope(name):
         size = x.get_shape().as_list()
-        nets = residual_block(x, output_channel=conv_dims, normalization=True, sn=sn, tower_config=tower_config)
+        nets = residual_block(x, output_channel=conv_dims, normalization=normalization_function, sn=sn, tower_config=tower_config)
         nets = tf.image.resize_images(nets, [size[1] * 2, size[2] * 2], tf.image.ResizeMethod.NEAREST_NEIGHBOR)
 
         return nets

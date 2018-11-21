@@ -1,5 +1,6 @@
 import os
 os.environ["nccl_multigpu_env"] = 'true'
+os.environ['NCCL_DEBUG'] = 'INFO'
 # os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 import numpy as np
@@ -15,15 +16,15 @@ flags.DEFINE_integer("gf_dim", 64, "Latent space dimensions [100]")
 flags.DEFINE_integer("df_dim", 64, "Latent space dimensions [100]")
 
 # Model options
-flags.DEFINE_string("model_name", "SNDCGAN_TypeB", "Epoch to train [25]")
+flags.DEFINE_string("model_name", "SNDCGAN_TypeB_ZGP_BN", "Epoch to train [25]")
 flags.DEFINE_integer("epoch", 400, "Epoch to train [25]")
-flags.DEFINE_integer("batch_size", 64, "The size of batch images per one GPU. [64]")
+flags.DEFINE_integer("batch_size", 4, "The size of batch images per one GPU. [64]")
 flags.DEFINE_integer("sample_num", 64, "The size of sample images [64]")
 flags.DEFINE_string("dataset", "LSUN_CHURCH_CENTER_SQUARE_256/images", "The name of dataset [celebA, mnist, lsun]")
 flags.DEFINE_string("data_dir", "/home/Databases/LSUN", "Root directory of dataset [data]")
 
 flags.DEFINE_integer("discriminator_iteration", 3, "How many times to repeat discriminator optimizer.")
-flags.DEFINE_integer("generator_iteration", 1, "How many times to repeat generator optimizer.")
+flags.DEFINE_integer("generator_iteration", 2, "How many times to repeat generator optimizer.")
 
 flags.DEFINE_float("learning_rate", 0.0002, "Learning rate of for adam [0.0002]")
 flags.DEFINE_float("beta1", 0.5, "Momentum term of adam [0.5]")
@@ -38,7 +39,7 @@ flags.DEFINE_integer("print_interval", 25, "Status print interval. [50]")
 flags.DEFINE_integer("ckpt_interval", 100, "Ckpt save interval. [50]")
 
 # System options
-gpu_list = [str(x) for x in [0, 1, 2, 3, 4, 5, 6, 7]]
+gpu_list = [str(x) for x in [0, 1]]
 print("Visible devices: ", ", ".join(gpu_list))
 flags.DEFINE_list("device_list", ['/gpu:{}'.format(x) for x in range(len(gpu_list))], "GPU to utilize.")
 

@@ -45,7 +45,7 @@ def discriminator(image_, batch_size, df_dim, tower_config=None, name="discrimin
 def init_stage(image_, batch_size, conv_dims, name="init_stage", sn=False, tower_config=None):
     with tf.variable_scope(name):
         nets = image_
-        nets = residual_block(nets, conv_dims, normalization=False, sn=sn, tower_config=tower_config)
+        nets = residual_block(nets, conv_dims, normalization=None, sn=sn, tower_config=tower_config)
         nets = tf.nn.avg_pool(nets, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="VALID")
 
     return nets
@@ -53,7 +53,7 @@ def init_stage(image_, batch_size, conv_dims, name="init_stage", sn=False, tower
 
 def repeat_stage(nets, batch_size, conv_dims, name="repeat_stage", sn=False, tower_config=None):
     with tf.variable_scope(name):
-        nets = residual_block(nets, conv_dims, normalization=False, sn=sn, tower_config=tower_config)
+        nets = residual_block(nets, conv_dims, normalization=None, sn=sn, tower_config=tower_config)
         nets = tf.nn.avg_pool(nets, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="VALID")
 
         return nets
@@ -61,7 +61,7 @@ def repeat_stage(nets, batch_size, conv_dims, name="repeat_stage", sn=False, tow
 
 def final_stage(nets, batch_size, conv_dims, name="final_stage", sn=False, tower_config=None):
     with tf.variable_scope(name):
-        nets = residual_block(nets, conv_dims, normalization=False, sn=sn, tower_config=tower_config)
+        nets = residual_block(nets, conv_dims, normalization=None, sn=sn, tower_config=tower_config)
         nets = relu(nets, tower_config=tower_config)
 
         nets = tf.reduce_sum(nets, axis=[1, 2])
