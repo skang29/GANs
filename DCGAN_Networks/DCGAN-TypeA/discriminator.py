@@ -47,7 +47,7 @@ def init_stage(image_, batch_size, conv_dims, name="init_stage", sn=False):
 def repeat_stage(nets, batch_size, conv_dims, name="repeat_stage", sn=False):
     with tf.variable_scope(name):
         nets = conv2d(nets, conv_dims)
-        # nets = batch_norm(nets)
+        nets = batch_norm(nets)
         nets = lrelu(nets)
 
         return nets
