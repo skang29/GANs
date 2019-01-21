@@ -24,7 +24,8 @@
             all_var_name_list = savedVarsName + restoreVarsName + globalVarsName
             all_var_name_list = sorted(list(set(all_var_name_list)))
 
-            print("\n---------+-------------+")
+            print("")
+            print("---------+-------------+")
             print("G  R  S  | Name")
             print("---------+-------------+")
             for v_name in all_var_name_list:
