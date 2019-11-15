@@ -1,117 +1,110 @@
-import argparse
-import time
-import warnings
-from tqdm import trange
-from datetime import datetime
+import os
 import numpy as np
+import tqdm
 
-import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
+import torch
+import torch.nn.functional as F
 import torch.distributed as dist
-import torch.optim
-import torch.utils.data
-import torch.utils.data.distributed
+import torch.backends.cudnn as cudnn
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 
-from network.generator import Generator
 from network.discriminator import Discriminator
+from network.generator import Generator
+from utils import AverageMeter, map_dict, save_checkpoint
+from ops import compute_zero_gp, accumulate
+from data_loader import CelebAANNO
 
-from data_loader import CelebAHQ
-from ops import compute_grad_gp
-from utils import *
+from metrics.fid_score import FID
 
 
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
+    cudnn.benchmark = True
 
     if args.gpu is not None:
-        print("Use GPU: {} for training".format(args.gpu))
+        print("Using GPU:{} for training.".format(args.gpu))
 
     if args.distributed:
-        if args.multiprocessing_distributed:
-            # For multiprocessing distributed training, rank needs to be the
-            # global rank among all the processes
-            args.rank = args.rank * ngpus_per_node + gpu
+        args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
-    print("[!] Building model ... ", end=' ', flush=True)
+    is_main = not args.distributed or args.rank % ngpus_per_node == 0
 
-    networks = [
-        Discriminator(img_size=64, sn=True),
-        Generator(latent_size=args.latent_size)
-    ]
+    if is_main: print("[!] Building model ... ", end=' ', flush=True)
+    networks = dict(
+        D=Discriminator(img_size=64, sn=True),
+        G=Generator(latent_size=args.latent_size)
+    )
+    if is_main:
+        networks_on_main = dict(
+            G_running=Generator(latent_size=args.latent_size).train(False)
+        )
 
     if args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            networks = [x.cuda(args.gpu) for x in networks]
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int(args.workers / ngpus_per_node)
+        args.batch_size = args.gpu_batch_size
+        args.workers = args.workers // ngpus_per_node
 
-            networks = [torch.nn.parallel.DistributedDataParallel(x, device_ids=[args.gpu]) for x in networks]
-        else:
-            networks = [x.cuda(args.gpu) for x in networks]
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
-            networks = [torch.nn.parallel.DistributedDataParallel(x) for x in networks]
+        torch.cuda.set_device(args.gpu)
+        networks = map_dict(
+            lambda x: torch.nn.parallel.DistributedDataParallel(x.cuda(args.gpu), device_ids=[args.gpu]),
+            networks
+        )
+
+        if is_main:
+            networks_on_main = map_dict(lambda x: x.cuda(args.gpu), networks_on_main)
+            networks.update(networks_on_main)
 
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
-        networks = [x.cuda(args.gpu) for x in networks]
+        networks = map_dict(lambda x: x.cuda(args.gpu), networks)
+        if is_main:
+            networks_on_main = map_dict(lambda x: x.cuda(args.gpu), networks_on_main)
+            networks.update(networks_on_main)
+
     else:
-        # DataParallel will divide and allocate batch_size to all available GPUs
-        networks = [x.cuda() for x in networks]
+        networks = map_dict(lambda x: x.cuda(), networks)
+        if is_main:
+            networks.update(networks_on_main)
 
-    discriminator, generator = networks
+    if is_main: accumulate(networks['G_running'], networks['G'].module, 0)
 
-    print("Done !")
+    if is_main: print("Done !")
 
-    print("[!] Building optimizer ... ", end=' ', flush=True)
-    criterion = nn.BCELoss().cuda(args.gpu)
-
-    d_opt = torch.optim.Adam(discriminator.parameters(), args.lr, betas=(0.5, 0.999), weight_decay=args.weight_decay)
-    g_opt = torch.optim.Adam(generator.parameters(), args.lr, betas=(0.5, 0.999), weight_decay=args.weight_decay)
-
-    print("Done !")
+    if is_main: print("[!] Building optimizer ... ", end=' ', flush=True)
+    d_opt = torch.optim.Adam(networks['D'].parameters(), args.lr, betas=(0.5, 0.999), weight_decay=args.weight_decay)
+    g_opt = torch.optim.Adam(networks['G'].parameters(), args.lr, betas=(0.5, 0.999), weight_decay=args.weight_decay)
+    optimizers = dict(D=d_opt, G=g_opt)
+    if is_main: print("Done !")
 
     if args.load_model is not None:
-        print("[!] Restoring model ... ")
+        if is_main: print("[!] Restoring model ... ")
+        with open(os.path.join(args.load_model, "ckpt", "checkpoint.txt"), "r") as f:
+            to_restore = f.readlines()[-1].strip()
+            load_file = os.path.join(args.load_model, "ckpt", to_restore)
 
-        check_load = open(os.path.join(args.log_dir, "checkpoint.txt"), 'r')
-        to_restore = check_load.readlines()[-1].strip()
-        load_file = os.path.join(args.log_dir, to_restore)
-        if os.path.isfile(load_file):
-            print(" => loading checkpoint '{}'".format(load_file))
-            checkpoint = torch.load(load_file, map_location='cpu')
-            args.start_epoch = checkpoint['epoch']
-            discriminator.load_state_dict(checkpoint['D_state_dict'])
-            generator.load_state_dict(checkpoint['G_state_dict'])
-            d_opt.load_state_dict(checkpoint['d_optimizer'])
-            g_opt.load_state_dict(checkpoint['g_optimizer'])
-            print(" => loaded checkpoint '{}' (epoch {})"
-                  .format(load_file, checkpoint['epoch']))
-        else:
-            print(" => no checkpoint found at '{}'".format(args.log_dir))
+            if os.path.isfile(load_file):
+                if is_main: print(" => loading checkpoint '{}'".format(load_file))
+                checkpoint = torch.load(load_file, map_location='cpu')
+                args.start_epoch = checkpoint['epoch']
+                networks['D'].load_state_dict(checkpoint['discriminator_state_dict'])
+                networks['G'].load_state_dict(checkpoint['generator_state_dict'])
+                networks['G_running'].load_state_dict(checkpoint['generator_running_state_dict'])
+                optimizers['G'].load_state_dict(checkpoint['d_opt'])
+                optimizers['D'].load_state_dict(checkpoint['g_opt'])
+                if is_main: print(" => loaded checkpoint '{}' (epoch {})".format(load_file, checkpoint['epoch']))
 
-    cudnn.benchmark = True
+            else:
+                if is_main: print(" => no checkpoint found at '{}'".format(args.load_model))
 
-    print("[!] Loading datasets ... ")
+    if is_main: print("[!] Loading dataset ... ")
     transform = transforms.Compose([transforms.CenterCrop(128),
                                     transforms.Resize(64),
                                     transforms.ToTensor(),
                                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    train_dataset = CelebAHQ(transform, 'train', args.batch_size, args.img_dir)
-    val_dataset = CelebAHQ(transform, 'val', args.batch_size, args.img_dir)
-    print("Done !")
+    train_dataset = CelebAANNO(transform, 'train', args.dataset_dir)
+    val_dataset = CelebAANNO(transform, 'val', args.dataset_dir)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -125,119 +118,183 @@ def main_worker(gpu, ngpus_per_node, args):
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size,
                                              num_workers=args.workers, pin_memory=True, drop_last=True)
 
+    if is_main: print("Done !")
+
     if args.validation:
-        validate(val_loader, discriminator, generator, criterion, 0, args)
-        return
+        validate(val_loader, networks, 0, args)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
+        if epoch % args.val_epoch == 0 and is_main:
+            validate(val_loader, networks, epoch, args)
+
         # train for one epoch
-        validate(val_loader, discriminator, generator, criterion, epoch, args)
-        train(train_loader, discriminator, generator, criterion, d_opt, g_opt, epoch, args)
+        train(train_loader, networks, optimizers, epoch, args, is_main)
 
-        # Save and Validate model only with main gpu
-        if not args.multiprocessing_distributed or (
-                args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-            with open(os.path.join(args.log_dir, "checkpoint.txt"), "a+") as check_list:
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'D_state_dict': discriminator.state_dict(),
-                    'G_state_dict': generator.state_dict(),
-                    'd_optimizer': d_opt.state_dict(),
-                    'g_optimizer': g_opt.state_dict(),
-                }, check_list, args.log_dir, epoch + 1)
-            print('')
+        # Save and validate model only with main gpu
+        if is_main:
+            with open(os.path.join(args.ckpt_dir, "checkpoint.txt"), "a+") as check_list:
+                save_checkpoint(
+                    dict(epoch=epoch+1,
+                         generator_state_dict=networks['G'].state_dict,
+                         generator_running_state_dict=networks['G_running'].state_dict,
+                         discriminator_state_dict=networks['D'].state_dict,
+                         g_opt=optimizers['G'],
+                         d_opt=optimizers['D'],
+                         ),
+                    check_list,
+                    args.ckpt_dir,
+                    epoch+1
+                )
 
 
-def train(train_loader, D, G, criterion, d_opt, g_opt, epoch, args):
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    d_losses = AverageMeter()
-    d_regs = AverageMeter()
-    g_losses = AverageMeter()
+def train(train_loader, networks, optimizers, epoch, args, is_main=False):
+    am_loss_g = AverageMeter()
+    am_loss_d = AverageMeter()
 
-    # switch to train mode
+    am_mean_r = AverageMeter()
+    am_mean_f = AverageMeter()
 
-    D.train()
-    G.train()
+    networks['G'].train()
+    networks['D'].train()
 
-    end = time.time()
+    ones = torch.ones(args.batch_size, 1)
+    zeros = torch.zeros(args.batch_size, 1)
+
+    if args.gpu is not None:
+        ones = ones.cuda(args.gpu, non_blocking=True)
+        zeros = zeros.cuda(args.gpu, non_blocking=True)
+
+    else:
+        ones = ones.cuda()
+        zeros = zeros.cuda()
+
+    print("", end="", flush=True)
     train_it = iter(train_loader)
-    t_train = trange(0, len(train_loader), initial=0, total=len(train_loader))
-    # for i, (x_real, _) in enumerate(train_loader):
-    for i in t_train:
-        x_real = next(train_it)
-        # measure data loading time
-        data_time.update(time.time() - end)
+    t_train = tqdm.trange(0, args.steps, disable=not is_main)
+    for t in t_train:
+        am_loss_g.reset()
+        am_loss_d.reset()
+        am_mean_r.reset()
+        am_mean_f.reset()
+        for i in range(args.ttur_d):
+            try:
+                x_real = next(train_it)
+            except StopIteration:
+                train_it = iter(train_loader)
+                x_real = next(train_it)
 
-        d_opt.zero_grad()
+            z_input = torch.randn(args.batch_size, args.latent_size)
+            if args.gpu is not None:
+                x_real = x_real.cuda(args.gpu, non_blocking=True)
+                z_input = z_input.cuda(args.gpu, non_blocking=True)
+            else:
+                x_real = x_real.cuda()
+                z_input = z_input.cuda()
 
-        z_input = torch.randn(args.batch_size, args.latent_size)
-        ones = torch.ones(args.batch_size, 1)
-        zeros = torch.zeros(args.batch_size, 1)
+            x_fake = networks['G'](z_input)
 
-        if args.gpu is not None:
-            x_real = x_real.cuda(args.gpu, non_blocking=True)
-            z_input = z_input.cuda(args.gpu, non_blocking=True)
-            ones = ones.cuda(args.gpu, non_blocking=True)
-            zeros = zeros.cuda(args.gpu, non_blocking=True)
+            if i == 0:
+                # G update
+                optimizers['G'].zero_grad()
 
-        x_real.requires_grad_()
+                # G forward
+                logit_d_fake = networks['D'](x_fake)
+                loss_g = F.binary_cross_entropy(logit_d_fake, ones)
 
-        d_real_logit = D(x_real)
-        d_adv_real = criterion(d_real_logit, ones)
-        d_adv_real.backward(retain_graph=True)
+                # G backward
+                loss_g.backward()
+                optimizers['G'].step()
+                if is_main:
+                    accumulate(networks['G_running'], networks['G'].module)
 
-        # D regularization, R1 - zero centered GP with real data
-        reg = 5.0 * compute_grad_gp(d_real_logit, x_real).mean()
-        reg.backward()
+                # AM update
+                am_loss_g.update(loss_g.item(), x_real.size(0))
 
-        # Train D with FAKE
-        x_fake = G(z_input)
-        d_fake_logit = D(x_fake.detach())
-        d_adv_fake = criterion(d_fake_logit, zeros)
-        d_adv_fake.backward()
+            # D update
+            optimizers['D'].zero_grad()
+            x_real.requires_grad_()
 
-        d_loss = d_adv_real + d_adv_fake
-        d_opt.step()
+            # D real forward
+            logit_d_real = networks['D'](x_real)
+            loss_d_real = F.binary_cross_entropy(logit_d_real, ones)
 
-        g_opt.zero_grad()
-        x_fake = G(z_input)
-        g_fake_logit = D(x_fake)
-        g_adv = criterion(g_fake_logit, ones)
-        g_loss = g_adv
-        g_loss.backward()
-        g_opt.step()
+            # D real regularization - 0-GP
+            loss_gp = 5.0 * compute_zero_gp(logit_d_real, x_real).mean()
 
-        # measure accuracy and record loss
-        d_losses.update(d_loss.item(), x_real.size(0))
-        d_regs.update(reg.item(), x_real.size(0))
-        g_losses.update(g_loss.item(), x_real.size(0))
+            # D fake forward
+            logit_d_fake = networks['D'](x_fake.detach())
+            loss_d_fake = F.binary_cross_entropy(logit_d_fake, zeros)
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            # D step
+            loss_d = loss_d_real + loss_d_fake + loss_gp
+            loss_d.backward()
+            optimizers['D'].step()
 
-        if i % args.log_step == 0:
+            # AM update
+            am_loss_d.update(loss_d.item(), x_real.size(0))
+            am_mean_r.update(logit_d_real.mean().item(), x_real.size(0))
+            am_mean_f.update(logit_d_fake.mean().item(), x_real.size(0))
+
+        if t % args.log_step == 0 and is_main:
             t_train.set_description('Epoch: [{}/{}], '
-                                    'Loss: D[{d_losses.avg:.3f}] '
-                                    'G[{g_losses.avg:.3f}]'.format(epoch, args.epochs,
-                                                                   d_losses=d_losses, g_losses=g_losses))
+                                    'Loss: '
+                                    'D[{loss_d.avg:.3f}] '
+                                    'G[{loss_g.avg:.3f}] '
+                                    'Fm[{mean_f.avg:.3f}] '
+                                    'Rm[{mean_r.avg:.3f}]'
+                                    ''.format(epoch,
+                                              args.epochs,
+                                              loss_d=am_loss_d,
+                                              loss_g=am_loss_g,
+                                              mean_f=am_mean_f,
+                                              mean_r=am_mean_r)
+                                    )
 
 
-def validate(data_loader, D, G, criterion, epoch, args):
-    # switch to evaluate mode
-    D.eval()
-    G.eval()
+def validate(val_loader, networks, epoch, args, is_main=False):
+    networks['G_running'].eval()
+
+    subFID_total = 1000
+    batch_size = args.batch_size
 
     with torch.no_grad():
-        z_val = torch.randn(args.batch_size, args.latent_size)
-        if args.gpu is not None:
-            z_val = z_val.cuda(args.gpu, non_blocking=True)
+        metric = FID(batch_size=batch_size, gpu=args.gpu)
+        metric.load_model()
 
-        x_fake_val = G(z_val)
+        trange = tqdm.trange(subFID_total // batch_size + 1)
 
-        vutils.save_image(x_fake_val, os.path.join(args.res_dir, '{}_{}_fake.png'.format(epoch, args.gpu)),
-                          normalize=True, nrow=int(np.sqrt(args.batch_size)))
+        trange.set_description('Epoch: [{}/{}], '
+                               'Metric: '
+                               'FID1K [{fid_score:.3f}] '
+                               ''.format(epoch,
+                                         args.epochs,
+                                         fid_score=0)
+                               )
+        for i, _ in enumerate(trange):
+            z_val = torch.randn(args.batch_size, args.latent_size)
+            if args.gpu is not None:
+                z_val = z_val.cuda(args.gpu)
+
+            x_fake = (networks['G_running'](z_val) + 1) / 2
+
+            metric.aggregate_activations(x_fake)
+
+            if i == subFID_total // batch_size:
+                vutils.save_image(x_fake.cpu(),
+                                  os.path.join(args.res_dir, "fake_{}.jpg".format(epoch)),
+                                  normalize=True,
+                                  nrow=int(np.sqrt(args.batch_size)))
+
+                metric.free_model()
+                metric.calculate_statistics()
+                fid_score = metric.measure_fid("./metrics/celeba_anno_val_full.npz")
+                trange.set_description('Epoch: [{}/{}], '
+                                       'Metric: '
+                                       'FID1K [{fid_score:.3f}] '
+                                       ''.format(epoch,
+                                                 args.epochs,
+                                                 fid_score=fid_score)
+                                       )

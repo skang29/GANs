@@ -65,7 +65,6 @@ class CelebAANNO(Dataset):
         return len(self.img_dir)
 
 
-
 class CelebAHQ(Dataset):
     def __init__(self,
                  transforms=None,
