@@ -42,3 +42,30 @@ def accumulate(dst, src, bn=False, decay=0.99):
 
         for k in dst_params.keys():
             dst_params[k].data.mul_(decay).add_(1-decay, src_params[k].data)
+            
+
+# Gradient penalties.            
+def compute_zero_gp(d_out, x_in):
+    batch_size = x_in.size(0)
+    grad_dout = autograd.grad(outputs=d_out.sum(),
+                              inputs=x_in,
+                              create_graph=True,
+                              retain_graph=True,
+                              only_inputs=True)[0]
+    grad_dout2 = grad_dout.pow(2)
+    assert(grad_dout2.size() == x_in.size())
+
+    return grad_dout2.view(batch_size, -1).sum(1).mean()
+
+
+def compute_one_gp(d_out, x_interp):
+    grad_dout = autograd.grad(outputs=d_out.sum(),
+                              inputs=x_interp,
+                              create_graph=True,
+                              retain_graph=True,
+                              only_inputs=True)[0]
+    grad_dout = grad_dout.view(grad_dout.size(0), -1)
+    slopes = torch.sqrt(torch.sum(torch.pow(grad_dout, 2), dim=1))
+    gp = torch.mean(torch.pow(slopes - 1., 2))
+
+    return gp  
